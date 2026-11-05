@@ -18,6 +18,8 @@ mod input;
 #[cfg(target_os = "android")]
 mod merge;
 #[cfg(target_os = "android")]
+mod omapi;
+#[cfg(target_os = "android")]
 mod partwork;
 #[cfg(target_os = "android")]
 mod pty;
@@ -29,6 +31,8 @@ mod relabel;
 mod secure;
 #[cfg(target_os = "android")]
 mod services;
+#[cfg(target_os = "android")]
+mod suspend;
 #[cfg(target_os = "android")]
 mod ui;
 #[cfg(target_os = "android")]

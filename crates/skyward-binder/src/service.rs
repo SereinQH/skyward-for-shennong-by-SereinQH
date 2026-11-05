@@ -20,6 +20,9 @@ struct Methods {
     /// Ask for a service without waiting for one that has not registered
     /// yet.
     check_service: u32,
+    /// Offer a service of this program's own to the directory, which
+    /// passes it on to whoever asks for it by name.
+    add_service: u32,
     /// List the names registered at the dump priorities given.
     list_services: u32,
     /// Ask whether the phone says it has a service, whether or not it is
@@ -34,8 +37,8 @@ const LOOKUPS_DECLARED: u32 = 36;
 /// its methods.
 fn methods_of(sdk: u32) -> Methods {
     match sdk >= LOOKUPS_DECLARED {
-        true => Methods { check_service: 3, list_services: 6, is_declared: 9 },
-        false => Methods { check_service: 2, list_services: 4, is_declared: 7 },
+        true => Methods { check_service: 3, add_service: 5, list_services: 6, is_declared: 9 },
+        false => Methods { check_service: 2, add_service: 3, list_services: 4, is_declared: 7 },
     }
 }
 
@@ -90,6 +93,25 @@ pub fn find<'a>(binder: &'a crate::driver::Binder, name: &str) -> Result<Option<
         Some(handle) => Ok(Some(crate::driver::Handle::hold(binder, handle)?)),
         None => Ok(None),
     }
+}
+
+/// Offer `at`, an object this program serves, to the directory under
+/// `name`. The directory keeps it and hands it to whoever asks for that
+/// name, and the calls that follow come back to this program's own
+/// [`crate::driver::Binder::serve`], which answers under the same number.
+#[cfg(target_os = "android")]
+pub fn add(binder: &crate::driver::Binder, name: &str, at: u64) -> Result<()> {
+    let what = format!("offer {name} to the service directory");
+    let directory = binder.directory()?;
+    let mut call = Parcel::call(DIRECTORY);
+    call.string(name);
+    call.object(at);
+    // No isolated program asks for this one, and it is not a service the
+    // directory is asked to dump.
+    call.bool(false);
+    call.i32(0);
+    let reply = directory.transact(methods()?.add_service, &call).with_context(|| what.clone())?;
+    status::ok(&mut reply.read()).with_context(|| what)
 }
 
 /// Every name registered with the directory, the directory's own among
@@ -147,9 +169,9 @@ mod tests {
     /// the first and the second of them.
     #[test]
     fn the_directory_of_android_16_numbers_its_methods_two_and_four_further_on() {
-        assert_eq!(methods_of(33), Methods { check_service: 2, list_services: 4, is_declared: 7 }, "the 13 Ultra's recovery");
+        assert_eq!(methods_of(33), Methods { check_service: 2, add_service: 3, list_services: 4, is_declared: 7 }, "the 13 Ultra's recovery");
         assert_eq!(methods_of(35), methods_of(33));
-        assert_eq!(methods_of(36), Methods { check_service: 3, list_services: 6, is_declared: 9 }, "the 17 Ultra's recovery");
+        assert_eq!(methods_of(36), Methods { check_service: 3, add_service: 5, list_services: 6, is_declared: 9 }, "the 17 Ultra's recovery");
         assert_eq!(methods_of(37), methods_of(36));
     }
 }

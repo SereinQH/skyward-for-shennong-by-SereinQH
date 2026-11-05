@@ -1,6 +1,9 @@
-use crate::parcel::{Payload, Reader};
+use crate::parcel::{Parcel, Payload, Reader};
 use anyhow::{bail, Context, Result};
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fs::File;
+use std::rc::Rc;
 use std::os::fd::AsRawFd;
 use std::path::Path;
 
@@ -34,10 +37,18 @@ const BINDER_VERSION: u32 = ioc(WRITE | READ, b'b', 9, 4);
 
 const BC_TRANSACTION: u32 = ioc(WRITE, b'c', 0, size_of::<TransactionData>());
 const BC_TRANSACTION_SG: u32 = ioc(WRITE, b'c', 17, size_of::<TransactionData>() + 8);
+const BC_REPLY: u32 = ioc(WRITE, b'c', 1, size_of::<TransactionData>());
 const BC_FREE_BUFFER: u32 = ioc(WRITE, b'c', 3, 8);
 const BC_ACQUIRE: u32 = ioc(WRITE, b'c', 5, 4);
 const BC_RELEASE: u32 = ioc(WRITE, b'c', 6, 4);
+const BC_INCREFS_DONE: u32 = ioc(WRITE, b'c', 8, 16);
+const BC_ACQUIRE_DONE: u32 = ioc(WRITE, b'c', 9, 16);
+const BC_ENTER_LOOPER: u32 = ioc(0, b'c', 12, 0);
 
+/// What the driver hands a call to: the object it was for, twice over — the
+/// number this side keeps and what answers for it — how far the object's
+/// interface travels, and the method and its arguments.
+const BR_TRANSACTION: u32 = ioc(READ, b'r', 2, size_of::<TransactionData>());
 const BR_ERROR: u32 = ioc(READ, b'r', 0, 4);
 const BR_REPLY: u32 = ioc(READ, b'r', 3, size_of::<TransactionData>());
 const BR_DEAD_REPLY: u32 = ioc(0, b'r', 5, 0);
@@ -55,6 +66,9 @@ const BR_FROZEN_REPLY: u32 = ioc(0, b'r', 18, 0);
 const TF_ACCEPT_FDS: u32 = 0x10;
 /// The reply carries a bare error number in place of a payload.
 const TF_STATUS_CODE: u32 = 0x08;
+/// Nobody waits on this call: it takes no answer, and the driver keeps no
+/// way to carry one back over it.
+const TF_ONE_WAY: u32 = 0x01;
 
 #[repr(C)]
 #[derive(Default)]
@@ -87,10 +101,27 @@ fn bytes_of<T>(v: &T) -> &[u8] {
     unsafe { std::slice::from_raw_parts((v as *const T).cast::<u8>(), size_of::<T>()) }
 }
 
+/// Something this process serves: what the driver hands each call to, and
+/// what writes the answer. A program that serves anything names each of its
+/// objects by a number of its own, hands those numbers over in the calls and
+/// replies that carry the object, and answers the calls the driver brings
+/// back under the same numbers.
+#[cfg(target_os = "android")]
+pub trait Object {
+    /// Take method `code` from `call` and write into `reply` what the
+    /// interface says it answers.
+    fn on_transact(&self, code: u32, call: &mut Reader<'_>, reply: &mut Parcel) -> Result<()>;
+}
+
 /// This program's end of the driver.
 pub struct Binder {
     file: File,
     map: *mut libc::c_void,
+    /// What this program serves, by the number the driver knows each object
+    /// by. They are taken on before the first call is made: another program
+    /// may call one of them as soon as it is handed over, which is before
+    /// this one has sat down to listen.
+    objects: RefCell<HashMap<u64, Rc<dyn Object>>>,
 }
 
 impl Binder {
@@ -126,7 +157,16 @@ impl Binder {
         if map == libc::MAP_FAILED {
             return Err(std::io::Error::last_os_error()).context("map the driver's replies");
         }
-        Ok(Binder { file, map })
+        Ok(Binder { file, map, objects: RefCell::new(HashMap::new()) })
+    }
+
+    /// Take on the objects this program serves, each under the number the
+    /// driver will know it by. Every call that arrives for one of them is
+    /// answered from here on, whether this end is listening for calls or
+    /// waiting on one of its own.
+    #[cfg(target_os = "android")]
+    pub fn serving(&self, objects: Vec<(u64, Rc<dyn Object>)>) {
+        self.objects.borrow_mut().extend(objects);
     }
 
     /// The service directory, which every program reaches at handle 0. The
@@ -196,7 +236,29 @@ impl Binder {
             match note {
                 BR_NOOP | BR_TRANSACTION_COMPLETE | BR_SPAWN_LOOPER => {}
                 BR_INCREFS | BR_ACQUIRE | BR_RELEASE | BR_DECREFS => {
-                    skip(16);
+                    let asked = skip(16);
+                    // Being asked to hold an object is a question the driver
+                    // waits on: until it is answered, the object counts as
+                    // not yet held, and a call that hands it to another
+                    // process has nothing to hand over. Letting one go
+                    // needs no answer.
+                    let done = match note {
+                        BR_INCREFS => Some(BC_INCREFS_DONE),
+                        BR_ACQUIRE => Some(BC_ACQUIRE_DONE),
+                        _ => None,
+                    };
+                    if let Some(done) = done {
+                        self.tell(done, asked).context("say an object of ours is held")?;
+                    }
+                }
+                // A call for something this program serves, which can come
+                // while this end is waiting on a call of its own: a service
+                // the other end was handed answers back on the connection
+                // that handed it over.
+                BR_TRANSACTION => {
+                    let raw = skip(size_of::<TransactionData>());
+                    let td: TransactionData = unsafe { std::ptr::read_unaligned(raw.as_ptr().cast()) };
+                    self.answer_call(td)?;
                 }
                 BR_REPLY => {
                     let raw = skip(size_of::<TransactionData>());
@@ -238,6 +300,94 @@ impl Binder {
     fn free(&self, buffer: u64) -> Result<()> {
         self.tell(BC_FREE_BUFFER, &buffer.to_ne_bytes())
     }
+
+    /// Sit and listen: take whatever the driver brings and go on doing so
+    /// until the driver or the program ends. The process is told it will
+    /// take calls, and takes them one at a time on the thread this runs on.
+    #[cfg(target_os = "android")]
+    pub fn serve(&self) -> Result<()> {
+        self.tell(BC_ENTER_LOOPER, &[]).context("say we will take calls")?;
+        let mut said = vec![0u8; 4096];
+        loop {
+            let mut bwr = WriteRead {
+                read_size: said.len() as u64,
+                read_buffer: said.as_mut_ptr() as u64,
+                ..WriteRead::default()
+            };
+            unsafe { call(&self.file, BINDER_WRITE_READ, &mut bwr as *mut WriteRead as *mut libc::c_void) }
+                .context("take what the driver brings")?;
+            // A call this end made itself can fail while it waits, and that
+            // is worth saying but not worth stopping over: what is being
+            // listened for is the next call, not the last answer. Saying it
+            // is worth no more than that either: a line that cannot be
+            // written leaves the listening alone.
+            if let Err(e) = self.answer(&said[..bwr.read_consumed as usize]) {
+                let _ = skyward_sys::kmsg(&format!("listening to the driver: {e:#}"));
+            }
+        }
+    }
+
+    /// One call: what arrived for an object of ours, and what it answered.
+    #[cfg(target_os = "android")]
+    fn answer_call(&self, td: TransactionData) -> Result<()> {
+        // What arrived lies in the room the driver mapped for us, named by
+        // where it sits in the mapping.
+        let data = unsafe { std::slice::from_raw_parts(td.buffer as *const u8, td.data_size as usize) };
+        let _ = skyward_sys::kmsg(&format!(
+            "binder: object {} method {} flags {:#x} data {} offsets {}",
+            td.target, td.code, td.flags, td.data_size, td.offsets_size
+        ));
+        let object = self.objects.borrow().get(&td.target).cloned();
+        let mut reply = Parcel::default();
+        // Every request opens with what libbinder writes ahead of the
+        // method's own arguments — the strict-mode policy, the work source,
+        // the mark both ends agree on, and the name of the interface it is
+        // for — so what the method reads starts past all of that.
+        let mut call = Reader::new(data);
+        if let Err(e) = call.past_call_head() {
+            let _ = skyward_sys::kmsg(&format!("a call for object {} opens with nothing Skyward knows: {e:#}", td.target));
+        }
+        match object {
+            Some(object) => {
+                if let Err(e) = object.on_transact(td.code, &mut call, &mut reply) {
+                    let _ = skyward_sys::kmsg(&format!("answering method {} of object {}: {e:#}", td.code, td.target));
+                }
+            }
+            None => {
+                let _ = skyward_sys::kmsg(&format!("nothing here answers for object {}, method {}", td.target, td.code));
+            }
+        }
+        // Whoever called is waiting on an answer whether or not one was to
+        // be had, so an empty one goes back rather than nothing — unless
+        // the call was one-way, which nobody waits on: a one-way call is
+        // never joined to the answering thread's stack of calls, so the
+        // driver has nothing to carry an answer back over and refuses one
+        // outright. Asking it to carry one anyway only earns its refusal.
+        let answered = match td.flags & TF_ONE_WAY {
+            0 => self.reply(&reply),
+            _ => Ok(()),
+        };
+        // What the call arrived in is given back either way: an answer the
+        // driver refused must not leave the room it arrived in held.
+        let freed = self.free(td.buffer);
+        answered.context("answer a call")?;
+        freed.context("give back what the call arrived in")
+    }
+
+    /// Send back what a call answered.
+    #[cfg(target_os = "android")]
+    fn reply(&self, reply: &Parcel) -> Result<()> {
+        let values = reply.values();
+        let addresses = reply.addresses();
+        let td = TransactionData {
+            data_size: values.len() as u64,
+            offsets_size: (addresses.len() * 8) as u64,
+            buffer: values.as_ptr() as u64,
+            offsets: addresses.as_ptr() as u64,
+            ..TransactionData::default()
+        };
+        self.tell(BC_REPLY, bytes_of(&td))
+    }
 }
 
 impl Drop for Binder {
@@ -278,6 +428,17 @@ impl<'a> Handle<'a> {
 
     pub fn transact(&self, code: u32, data: &impl Payload) -> Result<Reply<'a>> {
         self.binder.transact(self.handle, code, data)
+    }
+
+    /// The number the driver knows this object by, kept without the borrow
+    /// it was found through: what a program holds on to when it will call
+    /// an object for as long as it lives, and takes up the connection it
+    /// found it through afresh. The share taken of the object stays taken,
+    /// which is the point of it.
+    pub fn keep(self) -> u32 {
+        let number = self.handle;
+        std::mem::forget(self);
+        number
     }
 }
 

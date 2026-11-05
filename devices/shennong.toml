@@ -17,10 +17,21 @@ gamma = 2.2
 
 [modules]
 sources = ["vendor_boot", "vendor_dlkm", "vendor", "system_dlkm"]
-load = ["synaptics_tcm2"]
+# The touchscreen's, and the ones the phone reads its secure element
+# through: the element sits behind the NFC controller on this phone, and
+# the weaver is the half of what opens the data partition that keeps its
+# value there, so nothing about the data partition works until the element
+# can be reached.
+load = ["synaptics_tcm2", "nxp-nci", "stm_nfc_i2c", "stm_st54se_gpio"]
 
 [touch]
 writes = [{ path = "/sys/class/touch/touch_dev/enable_touch_raw", value = "0" }]
+
+# The phone's own logger. Its programs write their own reports to it rather
+# than to their error stream, so a hardware service that turns a call away
+# says why here and nowhere else a recovery can see.
+[logd]
+libraries = []
 
 # Stage the shared libraries the key services ask for that the recovery's
 # own library folder does not carry, out of the installed system's, and lay
@@ -30,7 +41,7 @@ writes = [{ path = "/sys/class/touch/touch_dev/enable_touch_raw", value = "0" }]
 # LD_CONFIG_FILE, as the phone's own system starts them.
 [[service]]
 path = "/system/bin/sh"
-args = ["-c", "mkdir -p /kmlibs && cp /mnt/system/system/lib64/libhardware.so /mnt/system/system/lib64/libvndksupport.so /mnt/system/system/lib64/libnetutils.so /mnt/system/system/lib64/bootstrap/libdl_android.so /kmlibs/ && printf '[recovery]\\nnamespace.default.isolated = false\\n' > /kmlibs/ld.config.txt && printf '#!/system/bin/sh\\nexport LD_CONFIG_FILE=/kmlibs/ld.config.txt\\nexec \"$@\"\\n' > /kmlibs/km.sh && chmod 755 /kmlibs/km.sh && V=$(ls -d /system_dlkm/lib/modules/*/kernel/net/rfkill 2>/dev/null | head -1) && mount --bind $V/rfkill.ko /system_dlkm/flatten/lib/modules/rfkill.ko || true"]
+args = ["-c", "mkdir -p /kmlibs && chmod 755 /kmlibs && cp /mnt/system/system/lib64/libhardware.so /mnt/system/system/lib64/libvndksupport.so /mnt/system/system/lib64/libnetutils.so /mnt/system/system/lib64/bootstrap/libdl_android.so /kmlibs/ && printf '[recovery]\\nnamespace.default.isolated = false\\n' > /kmlibs/ld.config.txt && printf '#!/system/bin/sh\\nexport LD_CONFIG_FILE=/kmlibs/ld.config.txt\\nexec \"$@\"\\n' > /kmlibs/km.sh && chmod 755 /kmlibs/km.sh && chmod 755 /kmlibs/*.so && chmod 644 /kmlibs/ld.config.txt && V=$(ls -d /system_dlkm/lib/modules/*/kernel/net/rfkill 2>/dev/null | head -1) && mount --bind $V/rfkill.ko /system_dlkm/flatten/lib/modules/rfkill.ko || true"]
 oneshot = true
 user = "root"
 groups = ["root"]
@@ -110,6 +121,55 @@ libraries = ["/system/lib64", "/vendor/lib64"]
 ready_service = "android.hardware.boot.IBootControl/default"
 user = "root"
 groups = ["root"]
+
+# The secure element's own interface, which is the only thing in this
+# recovery that touches the chip. The weaver never does: it asks this layer
+# for the element, for a session on it, and for a channel on that, and sends
+# the element's own protocol through the channel. The phone starts this from
+# the init script and description it keeps beside it, and a recovery starts
+# nothing by itself, so it is named here.
+[[service]]
+path = "/vendor/bin/hw/android.hardware.secure_element-service.qti"
+libraries = ["/kmlibs", "/vendor/lib64", "/vendor/lib64/hw", "/system/lib64", "/odm/lib64", "/apex/com.android.vndk.v34/lib64"]
+ready_service = "android.hardware.secure_element.ISecureElement/eSE1"
+user = "root"
+groups = ["root"]
+
+# The weaver waits for the phone to say it has finished starting before it
+# will touch the element at all, and a recovery never says so by itself.
+[[service]]
+path = "/system/bin/sh"
+args = ["-c", "setprop sys.boot_completed 1; true"]
+oneshot = true
+user = "root"
+groups = ["root"]
+
+# The layer the weaver reaches secure elements through. Android keeps the
+# answering end of it in a service of its own inside the running system,
+# which a recovery does not run, and a weaver that cannot find it says
+# `Failed to connect to OMAPI` and reads no slot. Skyward answers it here
+# instead: the `skyward:` on the path says the program behind this service
+# is not one of the phone's but one the recovery serves itself, and the
+# element named first is the one above, by the name it registers under.
+[[service]]
+path = "skyward:omapi"
+args = ["eSE1"]
+ready_service = "android.se.omapi.ISecureElementService/default"
+manifest = '''<manifest version="1.0" type="device"><hal format="aidl"><name>android.se.omapi</name><fqname>ISecureElementService/default</fqname></hal></manifest>'''
+
+# The wake-lock service the weaver's transport takes before it touches the
+# element at all: a weaver that cannot reach it waits for the service for
+# good and never sends the first call. The running system keeps the
+# answering end inside system_server, which a recovery does not run, and
+# the installed system's own program for it cannot register with a
+# recovery's service directory. Skyward answers it here instead, as it
+# answers OMAPI: `skyward:` before the name says the program behind this
+# service is one the recovery serves itself, and nothing in a recovery ever
+# goes to its rest, so a lock taken and a lock given back both answer.
+[[service]]
+path = "skyward:suspend"
+ready_service = "android.system.suspend.ISystemSuspend/default"
+manifest = '''<manifest version="1.0" type="device"><hal format="aidl"><name>android.system.suspend</name><fqname>ISystemSuspend/default</fqname></hal></manifest>'''
 
 # The weaver: the slot every user's secret is bound to on this NXP secure
 # element. Keymint wraps the keys with it, so it is the other half of the

@@ -41,6 +41,11 @@ const CAPABILITY_VERSION_3: u32 = 0x2008_0522;
 pub fn start(services: &[Service], libraries: Option<&Path>) -> Result<()> {
     let known = ueventd::accounts(&ueventd::PASSWD_FILES.iter().chain(&ueventd::GROUP_FILES).copied().collect::<Vec<_>>());
     for s in services {
+        if let Some(which) = s.path.strip_prefix(skyward_config::BUILT_IN) {
+            serve_here(which, s)?;
+            ready(s)?;
+            continue;
+        }
         if !Path::new(&s.path).is_file() {
             bail!("{} is missing; is its partition mounted?", s.path);
         }
@@ -61,6 +66,47 @@ pub fn start(services: &[Service], libraries: Option<&Path>) -> Result<()> {
         ready(&waiting)?;
     }
     Ok(())
+}
+
+/// Start a service this recovery serves itself rather than runs as a
+/// program of the phone's. `which` is what the configuration wrote after
+/// the marker, and the service's arguments are what that one asks for.
+fn serve_here(which: &str, s: &Service) -> Result<()> {
+    match which {
+        // The layer the weaver reads its secure element through, which the
+        // running system keeps in a service of its own that a recovery does
+        // not run. What it is given is the element, by the name the phone
+        // registers its own hardware service for that element under.
+        "omapi" => {
+            let reader = s.args.first().with_context(|| format!("{} names no element to serve", s.path))?.clone();
+            let path = s.path.clone();
+            thread::Builder::new()
+                .name(which.to_string())
+                .spawn(move || {
+                    if let Err(e) = crate::omapi::serve(&reader) {
+                        let _ = skyward_sys::kmsg(&format!("{path}: {e:#}"));
+                    }
+                })
+                .with_context(|| format!("start {}", s.path))?;
+            Ok(())
+        }
+        // The wake-lock service the weaver's transport takes before it
+        // reads the element. The running system keeps the answering end in
+        // a service of its own, which a recovery does not run.
+        "suspend" => {
+            let path = s.path.clone();
+            thread::Builder::new()
+                .name(which.to_string())
+                .spawn(move || {
+                    if let Err(e) = crate::suspend::serve() {
+                        let _ = skyward_sys::kmsg(&format!("{path}: {e:#}"));
+                    }
+                })
+                .with_context(|| format!("start {}", s.path))?;
+            Ok(())
+        }
+        other => bail!("{} names {other}, which this recovery does not serve itself", s.path),
+    }
 }
 
 /// Who a program runs as and what of root's it keeps, as the phone's own
@@ -113,6 +159,27 @@ impl Credentials {
     fn take_on(&self) -> io::Result<()> {
         let done = |r: libc::c_int| if r == 0 { Ok(()) } else { Err(io::Error::last_os_error()) };
         let prctl = |option: libc::c_int, a: libc::c_ulong, b: libc::c_ulong| done(unsafe { libc::prctl(option, a, b, 0 as libc::c_ulong, 0 as libc::c_ulong) });
+        // The signal mask is the one thing the exec carries over. The
+        // phone's own init starts every program with none of it set, and a
+        // program started from here should start the same way rather than
+        // with whatever mask this one happens to be carrying. Asked of the
+        // kernel itself: bionic's own call goes through the thread library,
+        // and a program that has only just forked has none of that set up
+        // yet. What no clearing takes away is bionic's own reserve of a
+        // real-time signal, which every program on the phone carries and
+        // none can put down. Clearing this mask was once thought to free
+        // the weaver, which was waiting on something else.
+        unsafe {
+            let mut none: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut none);
+            libc::syscall(
+                libc::SYS_rt_sigprocmask,
+                libc::SIG_SETMASK as libc::c_long,
+                &none as *const libc::sigset_t,
+                std::ptr::null::<libc::sigset_t>(),
+                size_of::<libc::sigset_t>() as libc::c_long,
+            );
+        }
         if self.kept.is_some() {
             prctl(libc::PR_SET_KEEPCAPS, 1, 0)?;
         }

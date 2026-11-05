@@ -15,6 +15,23 @@ const UNSET_WORK_SOURCE: i32 = -1;
 /// An object in the sending process, as a transaction carries it.
 const BINDER_TYPE_HANDLE: u32 = u32::from_be_bytes([b's', b'h', b'*', 0x85]);
 
+/// An object in this process, which the driver turns into something the
+/// other side can call.
+const BINDER_TYPE_BINDER: u32 = u32::from_be_bytes([b's', b'b', b'*', 0x85]);
+
+/// How the driver is told what an object handed over may do. The low bits
+/// are the highest priority a thread taking a call on it may run at, and
+/// the one set above them lets the call carry a file descriptor.
+const BINDER_FLAGS: u32 = 0x7f | 0x100;
+
+/// What an object of this program's is worth to the phone, written beside
+/// every object a call carries and read back by the other end before it
+/// will take one. libbinder knows three: nothing said, the system's own,
+/// and the phone's build declared it — and an object a hardware interface
+/// takes has to be the last of those. It is written as the two kinds it
+/// joins, the system's and the vendor's.
+const STABILITY: i32 = 3;
+
 /// What a call carries. The values themselves are most of it; a call that
 /// hands over an address says where among the values that address sits, and
 /// how much room the far side needs for everything the addresses point at.
@@ -35,11 +52,19 @@ pub trait Payload {
 #[derive(Default)]
 pub struct Parcel {
     data: Vec<u8>,
+    /// Where among the values each object this side hands over sits. The
+    /// driver is told of them the way it is told of an address, so both are
+    /// kept as one list of places in the values.
+    objects: Vec<u64>,
 }
 
 impl Payload for Parcel {
     fn values(&self) -> &[u8] {
         self.bytes()
+    }
+
+    fn addresses(&self) -> &[u64] {
+        &self.objects
     }
 }
 
@@ -93,6 +118,24 @@ impl Parcel {
         self.i32(0);
     }
 
+    /// An object this process serves, named by the number it keeps for it.
+    /// What the driver is handed so that the far side can call back: the
+    /// object's kind, what a call on it may do, the number twice over —
+    /// once as the object itself and once as what answers for it — and how
+    /// far the object's interface is meant to travel.
+    pub fn object(&mut self, at: u64) {
+        self.serves(at, STABILITY);
+    }
+
+    fn serves(&mut self, at: u64, stability: i32) {
+        self.objects.push(self.data.len() as u64);
+        self.i32(BINDER_TYPE_BINDER as i32);
+        self.i32(BINDER_FLAGS as i32);
+        self.i64(at as i64);
+        self.i64(at as i64);
+        self.i32(stability);
+    }
+
     /// Text, as the count of UTF-16 units, those units, a terminator, and
     /// padding to the next four.
     pub fn string(&mut self, s: &str) {
@@ -138,6 +181,18 @@ impl<'a> Reader<'a> {
 
     pub fn here(&self) -> usize {
         self.at
+    }
+
+    /// Step past what libbinder writes ahead of any method's own
+    /// arguments: the strict-mode policy, the work source, the mark both
+    /// ends agree on, and the name of the interface the call is for. What
+    /// the method itself reads starts where this leaves off.
+    pub fn past_call_head(&mut self) -> Result<()> {
+        self.i32().context("read the strict-mode policy")?;
+        self.i32().context("read the work source")?;
+        self.i32().context("read the mark of the library the call was written by")?;
+        self.string().context("read the interface the call is for")?;
+        Ok(())
     }
 
     pub fn go(&mut self, at: usize) -> Result<()> {
