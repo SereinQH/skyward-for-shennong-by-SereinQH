@@ -30,6 +30,13 @@ pub mod ramdisk {
     }
 }
 
+/// What a service's path begins with when the program behind it is not one
+/// of the phone's but one this recovery serves itself. What follows is
+/// which of them; the rest of the service's own settings mean what they
+/// mean for a program of the phone's, so a service that is served here is
+/// put in the order, waited on and described the same way.
+pub const BUILT_IN: &str = "skyward:";
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct DeviceConfig {
     pub device: Device,
